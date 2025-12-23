@@ -31,6 +31,51 @@ import sys
 import torch
 from typing import Optional
 
+# Step identifiers for restartability
+STEPS = [
+    "extract_frames",
+    "symlink_dataset",
+    "run_colmap",
+    "convert_to_json",
+    "generate_config",
+    "train",
+    "extract_mesh",
+]
+STATE_FILE = "completed_steps.txt"
+
+
+class StateTracker:
+    """Tracks completed pipeline steps for restartability."""
+
+    def __init__(self, run_root: pathlib.Path):
+        self.state_file = run_root / STATE_FILE
+        self.completed = self._load()
+
+    def _load(self) -> set[str]:
+        if not self.state_file.exists():
+            return set()
+        with open(self.state_file, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+
+    def is_done(self, step: str) -> bool:
+        return step in self.completed
+
+    def mark_done(self, step: str) -> None:
+        if step not in self.completed:
+            self.completed.add(step)
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.state_file, "w") as f:
+                for s in STEPS:
+                    if s in self.completed:
+                        f.write(f"{s}\n")
+            print(f"✓ Step '{step}' marked complete")
+
+    def skip_if_done(self, step: str) -> bool:
+        if self.is_done(step):
+            print(f"⊘ Skipping '{step}' (already completed)")
+            return True
+        return False
+
 
 def shlex_quote(s: str) -> str:
     """Minimal shlex-like quoting for printing commands."""
@@ -223,7 +268,10 @@ def _main() -> None:
         help="Neuralangelo repo root (contains train.py, projects/...).",
     )
     parser.add_argument(
-        "--gpus", default=torch.cuda.device_count(), type=int, help="GPUs for torchrun --nproc_per_node."
+        "--gpus",
+        default=torch.cuda.device_count(),
+        type=int,
+        help="GPUs for torchrun --nproc_per_node.",
     )
     parser.add_argument(
         "--max_iter",
@@ -319,6 +367,9 @@ def _main() -> None:
     dataset_dir.mkdir(parents=True, exist_ok=True)
     mesh_dir.mkdir(parents=True, exist_ok=True)
 
+    # Initialize state tracker for restartability
+    state = StateTracker(run_root)
+
     print(f"Repo root:   {repo_root}")
     print(f"Run root:    {run_root}")
     print(f"Scene type:  {scene_type}")
@@ -332,117 +383,143 @@ def _main() -> None:
     )
 
     # Step 4: Extract frames.
-    existing = sorted(images_dir.glob("frame_*.png"))
-    if args.reuse_frames and existing:
-        print(f"Reusing {len(existing)} existing frames in: {images_dir}")
-    else:
-        _extract_frames_ffmpeg(
-            video_path=video_path, images_dir=images_dir, fps=args.fps
-        )
+    if not state.skip_if_done("extract_frames"):
+        existing = sorted(images_dir.glob("frame_*.png"))
+        if args.reuse_frames and existing:
+            print(f"Reusing {len(existing)} existing frames in: {images_dir}")
+        else:
+            _extract_frames_ffmpeg(
+                video_path=video_path, images_dir=images_dir, fps=args.fps
+            )
+        state.mark_done("extract_frames")
 
     # Step 5: Some repos assume ./datasets/<sequence>. Make a best-effort symlink.
-    _best_effort_symlink(repo_root / "datasets" / run_name, dataset_dir)
+    if not state.skip_if_done("symlink_dataset"):
+        _best_effort_symlink(repo_root / "datasets" / run_name, dataset_dir)
+        state.mark_done("symlink_dataset")
 
     # Step 6: Run COLMAP via Neuralangelo helper script.
-    if args.colmap_script:
-        run_colmap_sh = pathlib.Path(args.colmap_script).expanduser().resolve()
-    else:
-        run_colmap_sh = (
-            repo_root / "projects" / "neuralangelo" / "scripts" / "run_colmap.sh"
-        )
-    _require_exists(run_colmap_sh, "run_colmap.sh")
+    if not state.skip_if_done("run_colmap"):
+        if args.colmap_script:
+            run_colmap_sh = pathlib.Path(args.colmap_script).expanduser().resolve()
+        else:
+            run_colmap_sh = (
+                repo_root / "projects" / "neuralangelo" / "scripts" / "run_colmap.sh"
+            )
+        _require_exists(run_colmap_sh, "run_colmap.sh")
 
-    # Step 6a: Clean partial COLMAP outputs if sparse is empty or missing.
-    sparse_dir = dataset_dir / "sparse"
-    if sparse_dir.exists() and not any(sparse_dir.rglob("*")):
-        shutil.rmtree(sparse_dir, ignore_errors=True)
-    # (Optional) keep database.db if you want incremental runs; default is clean slate.
-    if (dataset_dir / "database.db").exists():
-        (dataset_dir / "database.db").unlink()
+        # Step 6a: Clean partial COLMAP outputs if sparse is empty or missing.
+        sparse_dir = dataset_dir / "sparse"
+        if sparse_dir.exists() and not any(sparse_dir.rglob("*")):
+            shutil.rmtree(sparse_dir, ignore_errors=True)
+        # (Optional) keep database.db if you want incremental runs; default is clean slate.
+        if (dataset_dir / "database.db").exists():
+            (dataset_dir / "database.db").unlink()
 
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
 
-    _run_cmd(["bash", str(run_colmap_sh), str(dataset_dir)], cwd=repo_root, env=env)
+        _run_cmd(["bash", str(run_colmap_sh), str(dataset_dir)], cwd=repo_root, env=env)
 
-    # Step 6b: Verify COLMAP produced a model.
-    model0 = dataset_dir / "sparse" / "0"
-    if not model0.exists():
-        raise RuntimeError(
-            "COLMAP did not produce sparse/0. "
-            "If you still see ExistsDir(*image_path), your run_colmap.sh is using an "
-            "unexpected images folder name. This driver creates BOTH images and images_2, "
-            "so that usually indicates the script is pointing somewhere else."
-        )
+        # Step 6b: Verify COLMAP produced a model.
+        model0 = dataset_dir / "sparse" / "0"
+        if not model0.exists():
+            raise RuntimeError(
+                "COLMAP did not produce sparse/0. "
+                "If you still see ExistsDir(*image_path), your run_colmap.sh is using an "
+                "unexpected images folder name. This driver creates BOTH images and images_2, "
+                "so that usually indicates the script is pointing somewhere else."
+            )
+        state.mark_done("run_colmap")
 
     # Step 7: Convert COLMAP outputs to transforms.json.
-    convert_py = (
-        repo_root / "projects" / "neuralangelo" / "scripts" / "convert_data_to_json.py"
-    )
-    _require_exists(convert_py, "convert_data_to_json.py")
+    if not state.skip_if_done("convert_to_json"):
+        convert_py = (
+            repo_root
+            / "projects"
+            / "neuralangelo"
+            / "scripts"
+            / "convert_data_to_json.py"
+        )
+        _require_exists(convert_py, "convert_data_to_json.py")
 
-    convert_cmd = [
-        sys.executable,
-        str(convert_py),
-        "--data_dir",
-        str(dataset_dir),
-        "--scene_type",
-        scene_type,
-    ]
-    if args.auto_exposure_wb:
-        convert_cmd.append("--auto_exposure_wb")
-    _run_cmd(convert_cmd, cwd=repo_root, env=env)
-
-    transforms_json = dataset_dir / "transforms.json"
-    _require_exists(transforms_json, "transforms.json")
-
-    # Step 8: Generate a training config.
-    generate_py = (
-        repo_root / "projects" / "neuralangelo" / "scripts" / "generate_config.py"
-    )
-    _require_exists(generate_py, "generate_config.py")
-
-    _run_cmd(
-        [
+        convert_cmd = [
             sys.executable,
-            str(generate_py),
-            "--sequence_name",
-            run_name,
+            str(convert_py),
             "--data_dir",
             str(dataset_dir),
             "--scene_type",
             scene_type,
-            "--max_iter",
-            str(args.max_iter),
-        ],
-        cwd=repo_root,
-        env=env,
-    )
+        ]
+        if args.auto_exposure_wb:
+            convert_cmd.append("--auto_exposure_wb")
+        _run_cmd(convert_cmd, cwd=repo_root, env=env)
 
-    cfg_custom = (
-        repo_root
-        / "projects"
-        / "neuralangelo"
-        / "configs"
-        / "custom"
-        / f"{run_name}.yaml"
-    )
-    _require_exists(cfg_custom, "generated config yaml")
+        transforms_json = dataset_dir / "transforms.json"
+        _require_exists(transforms_json, "transforms.json")
+        state.mark_done("convert_to_json")
+
+    # Step 8: Generate a training config.
+    if not state.skip_if_done("generate_config"):
+        generate_py = (
+            repo_root / "projects" / "neuralangelo" / "scripts" / "generate_config.py"
+        )
+        _require_exists(generate_py, "generate_config.py")
+
+        _run_cmd(
+            [
+                sys.executable,
+                str(generate_py),
+                "--sequence_name",
+                run_name,
+                "--data_dir",
+                str(dataset_dir),
+                "--scene_type",
+                scene_type,
+                "--max_iter",
+                str(args.max_iter),
+            ],
+            cwd=repo_root,
+            env=env,
+        )
+
+        cfg_custom = (
+            repo_root
+            / "projects"
+            / "neuralangelo"
+            / "configs"
+            / "custom"
+            / f"{run_name}.yaml"
+        )
+        _require_exists(cfg_custom, "generated config yaml")
+        state.mark_done("generate_config")
+    else:
+        cfg_custom = (
+            repo_root
+            / "projects"
+            / "neuralangelo"
+            / "configs"
+            / "custom"
+            / f"{run_name}.yaml"
+        )
+        _require_exists(cfg_custom, "generated config yaml")
 
     # Step 9: Train.
     logdir = logs_root / args.group / run_name
     logdir.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_train:
-        train_cmd = [
-            "torchrun",
-            f"--nproc_per_node={args.gpus}",
-            "train.py",
-            f"--logdir={logdir}",
-            f"--config={cfg_custom}",
-            "--show_pbar",
-        ]
-        _run_cmd(train_cmd, cwd=repo_root, env=env)
+        if not state.skip_if_done("train"):
+            train_cmd = [
+                "torchrun",
+                f"--nproc_per_node={args.gpus}",
+                "train.py",
+                f"--logdir={logdir}",
+                f"--config={cfg_custom}",
+                "--show_pbar",
+            ]
+            _run_cmd(train_cmd, cwd=repo_root, env=env)
+            state.mark_done("train")
 
     # Step 10: Choose checkpoint.
     if args.checkpoint.strip():
@@ -453,33 +530,41 @@ def _main() -> None:
     print(f"Using checkpoint: {ckpt}")
 
     # Step 11: Extract mesh.
-    extract_py = repo_root / "projects" / "neuralangelo" / "scripts" / "extract_mesh.py"
-    _require_exists(extract_py, "extract_mesh.py")
+    if not state.skip_if_done("extract_mesh"):
+        extract_py = (
+            repo_root / "projects" / "neuralangelo" / "scripts" / "extract_mesh.py"
+        )
+        _require_exists(extract_py, "extract_mesh.py")
 
-    log_config = logdir / "config.yaml"
-    config_for_extract = log_config if log_config.exists() else cfg_custom
+        log_config = logdir / "config.yaml"
+        config_for_extract = log_config if log_config.exists() else cfg_custom
 
-    out_mesh = mesh_dir / f"{run_name}_res{args.resolution}.ply"
-    extract_cmd = [
-        "torchrun",
-        f"--nproc_per_node={args.gpus}",
-        str(extract_py),
-        "--config",
-        str(config_for_extract),
-        "--checkpoint",
-        str(ckpt),
-        "--output_file",
-        str(out_mesh),
-        "--resolution",
-        str(args.resolution),
-        "--block_res",
-        str(args.block_res),
-        "--keep_lcc",
-        "--textured",
-    ]
-    _run_cmd(extract_cmd, cwd=repo_root, env=env)
+        out_mesh = mesh_dir / f"{run_name}_res{args.resolution}.ply"
+        extract_cmd = [
+            "torchrun",
+            f"--nproc_per_node={args.gpus}",
+            str(extract_py),
+            "--config",
+            str(config_for_extract),
+            "--checkpoint",
+            str(ckpt),
+            "--output_file",
+            str(out_mesh),
+            "--resolution",
+            str(args.resolution),
+            "--block_res",
+            str(args.block_res),
+            "--keep_lcc",
+            "--textured",
+        ]
+        _run_cmd(extract_cmd, cwd=repo_root, env=env)
 
-    _require_exists(out_mesh, "output mesh file")
+        _require_exists(out_mesh, "output mesh file")
+        state.mark_done("extract_mesh")
+    else:
+        out_mesh = mesh_dir / f"{run_name}_res{args.resolution}.ply"
+        _require_exists(out_mesh, "output mesh file")
+
     print("\n✅ Done.")
     print(f"Mesh: {out_mesh}")
     print(f"Run root: {run_root}")
