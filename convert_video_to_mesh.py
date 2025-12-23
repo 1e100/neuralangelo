@@ -226,6 +226,12 @@ def _main() -> None:
         "--gpus", default=torch.cuda.device_count(), type=int, help="GPUs for torchrun --nproc_per_node."
     )
     parser.add_argument(
+        "--max_iter",
+        default=500000,
+        type=int,
+        help="Maximum training iterations.",
+    )
+    parser.add_argument(
         "--group",
         default="na_runs",
         type=str,
@@ -406,6 +412,8 @@ def _main() -> None:
             str(dataset_dir),
             "--scene_type",
             scene_type,
+            "--max_iter",
+            str(args.max_iter),
         ],
         cwd=repo_root,
         env=env,

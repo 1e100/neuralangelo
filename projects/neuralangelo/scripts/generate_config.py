@@ -27,6 +27,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 def generate_config(args):
     cfg = Dict()
     cfg._parent_ = "projects/neuralangelo/configs/base.yaml"
+    cfg.max_iter = args.max_iter
     num_images = len(os.listdir(os.path.join(args.data_dir, "images")))
     # model cfg
     if args.auto_exposure_wb:
@@ -72,6 +73,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--sequence_name", type=str, default="recon", help="Name of sequence")
     parser.add_argument("--data_dir", type=str, default=None, help="Path to data")
+    parser.add_argument("--max_iter", type=int, default=500000, help="Maximum training iterations")
     parser.add_argument("--auto_exposure_wb", action="store_true",
                         help="Video capture with auto-exposure or white-balance")
     parser.add_argument("--scene_type", type=str, default="outdoor", choices=["outdoor", "indoor", "object"],
