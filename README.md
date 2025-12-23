@@ -20,16 +20,18 @@ For business inquiries, please submit the [NVIDIA research licensing form](https
 --------------------------------------
 
 ## Installation
-We offer two ways to setup the environment:
+We offer two ways to set up the environment:
 1. We provide prebuilt Docker images, where
     - `docker.io/chenhsuanlin/colmap:3.8` is for running COLMAP and the data preprocessing scripts. This includes the prebuilt COLMAP library (CUDA-supported).
     - `docker.io/chenhsuanlin/neuralangelo:23.04-py3` is for running the main Neuralangelo pipeline.
 
     The corresponding Dockerfiles can be found in the `docker` directory.
-2. The conda environment for Neuralangelo. Install the dependencies and activate the environment `neuralangelo` with
+2. A local `uv` virtual environment (Python <= 3.12). Install the dependencies and activate the environment with
     ```bash
-    conda env create --file neuralangelo.yaml
-    conda activate neuralangelo
+    uv venv --python 3.12
+    source .venv/bin/activate
+    uv pip install --index-url https://download.pytorch.org/whl/cu130 torch==2.9.1 torchvision
+    uv pip install --no-build-isolation -r requirements.txt
     ```
 For COLMAP, alternative installation options are also available on the [COLMAP website](https://colmap.github.io/).
 
