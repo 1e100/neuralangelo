@@ -510,14 +510,23 @@ def _main() -> None:
 
     if not args.skip_train:
         if not state.skip_if_done("train"):
-            train_cmd = [
-                "torchrun",
-                f"--nproc_per_node={args.gpus}",
-                "train.py",
-                f"--logdir={logdir}",
-                f"--config={cfg_custom}",
-                "--show_pbar",
-            ]
+            if args.gpus == 1:
+                train_cmd = [
+                    sys.executable,
+                    "train.py",
+                    f"--logdir={logdir}",
+                    f"--config={cfg_custom}",
+                    "--show_pbar",
+                ]
+            else:
+                train_cmd = [
+                    "torchrun",
+                    f"--nproc_per_node={args.gpus}",
+                    "train.py",
+                    f"--logdir={logdir}",
+                    f"--config={cfg_custom}",
+                    "--show_pbar",
+                ]
             _run_cmd(train_cmd, cwd=repo_root, env=env)
             state.mark_done("train")
 
@@ -540,23 +549,41 @@ def _main() -> None:
         config_for_extract = log_config if log_config.exists() else cfg_custom
 
         out_mesh = mesh_dir / f"{run_name}_res{args.resolution}.ply"
-        extract_cmd = [
-            "torchrun",
-            f"--nproc_per_node={args.gpus}",
-            str(extract_py),
-            "--config",
-            str(config_for_extract),
-            "--checkpoint",
-            str(ckpt),
-            "--output_file",
-            str(out_mesh),
-            "--resolution",
-            str(args.resolution),
-            "--block_res",
-            str(args.block_res),
-            "--keep_lcc",
-            "--textured",
-        ]
+        if args.gpus == 1:
+            extract_cmd = [
+                sys.executable,
+                str(extract_py),
+                "--config",
+                str(config_for_extract),
+                "--checkpoint",
+                str(ckpt),
+                "--output_file",
+                str(out_mesh),
+                "--resolution",
+                str(args.resolution),
+                "--block_res",
+                str(args.block_res),
+                "--keep_lcc",
+                "--textured",
+            ]
+        else:
+            extract_cmd = [
+                "torchrun",
+                f"--nproc_per_node={args.gpus}",
+                str(extract_py),
+                "--config",
+                str(config_for_extract),
+                "--checkpoint",
+                str(ckpt),
+                "--output_file",
+                str(out_mesh),
+                "--resolution",
+                str(args.resolution),
+                "--block_res",
+                str(args.block_res),
+                "--keep_lcc",
+                "--textured",
+            ]
         _run_cmd(extract_cmd, cwd=repo_root, env=env)
 
         _require_exists(out_mesh, "output mesh file")
