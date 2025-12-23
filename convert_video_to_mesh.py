@@ -514,6 +514,7 @@ def _main() -> None:
                 train_cmd = [
                     sys.executable,
                     "train.py",
+                    "--single_gpu",
                     f"--logdir={logdir}",
                     f"--config={cfg_custom}",
                     "--show_pbar",
@@ -553,6 +554,7 @@ def _main() -> None:
             extract_cmd = [
                 sys.executable,
                 str(extract_py),
+                "--single_gpu",
                 "--config",
                 str(config_for_extract),
                 "--checkpoint",
