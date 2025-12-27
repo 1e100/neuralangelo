@@ -230,18 +230,60 @@ def _extract_frames_ffmpeg(
     print(f"Extracted {num_frames} frames into: {images_dir}")
 
 
+def _copy_images_from_dir(source_dir: pathlib.Path, images_dir: pathlib.Path) -> None:
+    """Copies all images from a source directory to the target images directory.
+
+    Note: Always copies files (not symlinks) to avoid COLMAP path resolution issues
+    when the source directory is outside the target directory structure.
+
+    Supports common image extensions: .jpg, .jpeg, .png, .webp, .tiff, .bmp.
+    """
+    image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif", ".bmp"}
+    source_images = sorted(
+        [p for p in source_dir.iterdir() if p.suffix.lower() in image_extensions]
+    )
+
+    if not source_images:
+        raise RuntimeError(
+            f"No images found in {source_dir}. "
+            f"Supported formats: {', '.join(sorted(image_extensions))}"
+        )
+
+    # Remove existing frames if any
+    for existing in images_dir.glob("frame_*.png"):
+        existing.unlink()
+
+    # Copy all files (not symlinks) to avoid COLMAP path issues
+    for i, src_img in enumerate(source_images):
+        dest_path = images_dir / f"frame_{i:06d}.png"
+        shutil.copy2(src_img, dest_path)
+
+    print(f"Copied {len(source_images)} images from {source_dir} to {images_dir}")
+
+
 def _main() -> None:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument(
-        "--video_path", required=True, type=str, help="Path to input video file."
+
+    # Mutually exclusive input source: video OR image directory
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--video_path",
+        type=str,
+        help="Path to input video file.",
     )
+    input_group.add_argument(
+        "--image_dir",
+        type=str,
+        help="Path to directory containing input images.",
+    )
+
     parser.add_argument(
         "--fps",
         default=3.0,
         type=float,
-        help="Frame sampling rate in frames per second.",
+        help="Frame sampling rate in frames per second (only used with --video_path).",
     )
     parser.add_argument(
         "--scene_type",
@@ -326,21 +368,30 @@ def _main() -> None:
         help="Explicit checkpoint path. If empty, newest *.pt in logdir is used.",
     )
     parser.add_argument(
-        "--colmap_script",
-        default="",
+        "--colmap_matcher",
+        default="sequential",
         type=str,
-        help="Optional path to run_colmap.sh. If empty, uses repo default.",
+        choices=["sequential", "exhaustive", "vocab_tree"],
+        help="COLMAP matcher type: sequential (default), exhaustive, or vocab_tree.",
     )
 
     args = parser.parse_args()
 
     # Step 1: Normalize and validate args.
     repo_root = pathlib.Path(args.repo_root).resolve()
-    video_path = pathlib.Path(args.video_path).expanduser().resolve()
     output_dir = pathlib.Path(args.output_dir).expanduser().resolve()
     scene_type = _normalize_scene_type(args.scene_type)
 
-    _require_exists(video_path, "video file")
+    # Validate input source
+    if args.video_path:
+        video_path = pathlib.Path(args.video_path).expanduser().resolve()
+        _require_exists(video_path, "video file")
+        image_dir = None
+    else:  # args.image_dir
+        image_dir = pathlib.Path(args.image_dir).expanduser().resolve()
+        _require_exists(image_dir, "image directory")
+        video_path = None
+
     _require_exists(repo_root / "train.py", "Neuralangelo train.py (repo root)")
     _require_exists(
         repo_root / "projects" / "neuralangelo" / "scripts",
@@ -375,6 +426,9 @@ def _main() -> None:
     print(f"Scene type:  {scene_type}")
     print(f"FPS:         {args.fps}")
     print(f"Resolution:  {args.resolution}")
+    print(
+        f"Input:       {'video: ' + str(video_path) if video_path else 'images: ' + str(image_dir)}"
+    )
 
     # Step 3: Ensure images + images_2 aliases exist and choose where to write frames.
     images_dir = _ensure_colmap_image_dir_aliases(
@@ -382,15 +436,17 @@ def _main() -> None:
         primary_images_dirname=args.primary_images_dir,
     )
 
-    # Step 4: Extract frames.
+    # Step 4: Extract frames OR copy images from directory.
     if not state.skip_if_done("extract_frames"):
         existing = sorted(images_dir.glob("frame_*.png"))
         if args.reuse_frames and existing:
             print(f"Reusing {len(existing)} existing frames in: {images_dir}")
-        else:
+        elif video_path:
             _extract_frames_ffmpeg(
                 video_path=video_path, images_dir=images_dir, fps=args.fps
             )
+        else:  # image_dir
+            _copy_images_from_dir(source_dir=image_dir, images_dir=images_dir)
         state.mark_done("extract_frames")
 
     # Step 5: Some repos assume ./datasets/<sequence>. Make a best-effort symlink.
@@ -398,16 +454,8 @@ def _main() -> None:
         _best_effort_symlink(repo_root / "datasets" / run_name, dataset_dir)
         state.mark_done("symlink_dataset")
 
-    # Step 6: Run COLMAP via Neuralangelo helper script.
+    # Step 6: Run COLMAP directly (mimics run_colmap.sh behavior).
     if not state.skip_if_done("run_colmap"):
-        if args.colmap_script:
-            run_colmap_sh = pathlib.Path(args.colmap_script).expanduser().resolve()
-        else:
-            run_colmap_sh = (
-                repo_root / "projects" / "neuralangelo" / "scripts" / "run_colmap.sh"
-            )
-        _require_exists(run_colmap_sh, "run_colmap.sh")
-
         # Step 6a: Clean partial COLMAP outputs if sparse is empty or missing.
         sparse_dir = dataset_dir / "sparse"
         if sparse_dir.exists() and not any(sparse_dir.rglob("*")):
@@ -419,16 +467,110 @@ def _main() -> None:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
 
-        _run_cmd(["bash", str(run_colmap_sh), str(dataset_dir)], cwd=repo_root, env=env)
+        images_raw = dataset_dir / "images_raw"
+        database_path = dataset_dir / "database.db"
+        sparse_path = dataset_dir / "sparse"
+
+        # feature_extractor
+        _run_cmd(
+            [
+                "colmap",
+                "feature_extractor",
+                f"--database_path={database_path}",
+                f"--image_path={images_raw}",
+                "--ImageReader.camera_model=SIMPLE_RADIAL",
+                "--ImageReader.single_camera=true",
+                "--FeatureExtraction.use_gpu=true",
+                "--FeatureExtraction.num_threads=32",
+            ],
+            cwd=repo_root,
+            env=env,
+        )
+
+        # matcher (selectable)
+        matcher_cmd = f"{args.colmap_matcher}_matcher"
+        _run_cmd(
+            [
+                "colmap",
+                matcher_cmd,
+                f"--database_path={database_path}",
+                "--FeatureMatching.use_gpu=true",
+            ],
+            cwd=repo_root,
+            env=env,
+        )
+
+        # mapper
+        sparse_path.mkdir(parents=True, exist_ok=True)
+        _run_cmd(
+            [
+                "colmap",
+                "mapper",
+                f"--database_path={database_path}",
+                f"--image_path={images_raw}",
+                f"--output_path={sparse_path}",
+            ],
+            cwd=repo_root,
+            env=env,
+        )
+
+        # Copy model binaries to sparse root
+        model0 = sparse_path / "0"
+        if model0.exists():
+            for f in model0.glob("*.bin"):
+                shutil.copy2(f, sparse_path / f.name)
+
+        # Merge multiple models if present (from run_colmap.sh)
+        for model_dir in sorted(sparse_path.glob("*/")):
+            m = model_dir.name
+            if m != "0":
+                _run_cmd(
+                    [
+                        "colmap",
+                        "model_merger",
+                        "--input_path1",
+                        str(sparse_path),
+                        "--input_path2",
+                        str(model_dir),
+                        "--output_path",
+                        str(sparse_path),
+                    ],
+                    cwd=repo_root,
+                    env=env,
+                )
+                _run_cmd(
+                    [
+                        "colmap",
+                        "bundle_adjuster",
+                        "--input_path",
+                        str(sparse_path),
+                        "--output_path",
+                        str(sparse_path),
+                    ],
+                    cwd=repo_root,
+                    env=env,
+                )
+
+        # image_undistorter
+        _run_cmd(
+            [
+                "colmap",
+                "image_undistorter",
+                f"--image_path={images_raw}",
+                f"--input_path={sparse_path}",
+                f"--output_path={dataset_dir}",
+                "--output_type=COLMAP",
+            ],
+            cwd=repo_root,
+            env=env,
+        )
 
         # Step 6b: Verify COLMAP produced a model.
-        model0 = dataset_dir / "sparse" / "0"
         if not model0.exists():
             raise RuntimeError(
                 "COLMAP did not produce sparse/0. "
-                "If you still see ExistsDir(*image_path), your run_colmap.sh is using an "
-                "unexpected images folder name. This driver creates BOTH images and images_2, "
-                "so that usually indicates the script is pointing somewhere else."
+                "If you still see ExistsDir(*image_path), your images_raw folder may be empty. "
+                "This driver creates BOTH images and images_2 as aliases to images_raw."
             )
         state.mark_done("run_colmap")
 
