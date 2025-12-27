@@ -22,6 +22,7 @@ dir_path = Path(os.path.dirname(os.path.realpath(__file__))).parents[2]
 sys.path.append(dir_path.__str__())
 
 from third_party.colmap.scripts.python.read_write_model import read_model, qvec2rotmat  # NOQA
+from point_cloud_denoise import denoise_point_cloud, save_denoised_model, get_denoise_args  # NOQA
 
 
 def find_closest_point(p1, d1, p2, d2):
@@ -190,6 +191,16 @@ def export_to_json(cameras, images, bounding_box, center, radius, file_path):
 def data_to_json(args):
     cameras, images, points3D = read_model(os.path.join(args.data_dir, "sparse"), ext=".bin")
 
+    # Apply denoising if requested
+    if args.denoise:
+        print("\n=== Point Cloud Denoising ===")
+        points3D = denoise_point_cloud(points3D, args)
+
+        # Save denoised model if requested
+        if args.save_denoised:
+            output_path = args.denoised_output_path or os.path.join(args.data_dir, "denoised")
+            save_denoised_model(cameras, images, points3D, output_path, ext=".bin")
+
     # define bounding regions based on scene type
     if args.scene_type == "outdoor":
         if check_concentric(images):
@@ -222,5 +233,6 @@ if __name__ == "__main__":
         help="Select scene type. Outdoor for building-scale reconstruction; "
         "indoor for room-scale reconstruction; object for object-centric scene reconstruction.",
     )
+    parser = get_denoise_args(parser)
     args = parser.parse_args()
     data_to_json(args)
